@@ -1,20 +1,55 @@
 package clickhouse_test
 
 import (
+	"context"
+	"crypto/tls"
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
+	"net"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/kshvakov/clickhouse"
+	"github.com/ClickHouse/clickhouse-go"
+	"github.com/ClickHouse/clickhouse-go/lib/column"
+	"github.com/ClickHouse/clickhouse-go/lib/types"
 	"github.com/stretchr/testify/assert"
+)
+
+const (
+	tlsName = "default_tls"
 )
 
 func Test_OpenConnectAndPing(t *testing.T) {
 	if connect, err := sql.Open("clickhouse", "tcp://127.0.0.1:9000?debug=true"); assert.NoError(t, err) {
 		assert.NoError(t, connect.Ping())
 	}
+}
+
+func Test_RegisterTLSConfig(t *testing.T) {
+	tlsConfig := &tls.Config{}
+
+	connect, err := sql.Open("clickhouse", "tcp://127.0.0.1:9000?debug=true&tls_config="+tlsName)
+	assert.NoError(t, err)
+	assert.EqualError(t, connect.Ping(), "invalid tls_config - no config registered under name default_tls")
+
+	err = clickhouse.RegisterTLSConfig(tlsName, tlsConfig)
+	assert.NoError(t, err)
+
+	connect, err = sql.Open("clickhouse", "tcp://127.0.0.1:9000?debug=true&secure=false&tls_config="+tlsName)
+	assert.NoError(t, err)
+	assert.NoError(t, connect.Ping())
+
+	connect, err = sql.Open("clickhouse", "tcp://127.0.0.1:9000?debug=true&tls_config="+tlsName)
+	assert.NoError(t, err)
+	assert.EqualError(t, connect.Ping(), "tls: first record does not look like a TLS handshake")
+
+	clickhouse.DeregisterTLSConfig(tlsName)
+
+	connect, err = sql.Open("clickhouse", "tcp://127.0.0.1:9000?debug=true&tls_config="+tlsName)
+	assert.NoError(t, err)
+	assert.EqualError(t, connect.Ping(), "invalid tls_config - no config registered under name default_tls")
 }
 
 func Test_CreateTable(t *testing.T) {
@@ -54,17 +89,22 @@ func Test_Insert(t *testing.T) {
 				string  String,
 				fString FixedString(2),
 				date    Date,
-				datetime DateTime
+				datetime DateTime,
+				datetime64 DateTime64,
+				ipv4 IPv4,
+				ipv6 IPv6,
+				ipv4str FixedString(16),
+				ipv6str FixedString(16)
 			) Engine=Memory
 		`
 		dml = `
 			INSERT INTO clickhouse_test_insert (
-				int8, 
-				int16, 
+				int8,
+				int16,
 				int32,
 				int64,
-				uint8, 
-				uint16, 
+				uint8,
+				uint16,
 				uint32,
 				uint64,
 				float32,
@@ -72,10 +112,19 @@ func Test_Insert(t *testing.T) {
 				string,
 				fString,
 				date,
-				datetime
+				datetime,
+				datetime64,
+				ipv4,
+				ipv6,
+				ipv4str,
+				ipv6str
 			) VALUES (
-				?, 
-				?, 
+				?,
+				?,
+				?,
+				?,
+				?,
+				?,
 				?,
 				?,
 				?,
@@ -91,13 +140,13 @@ func Test_Insert(t *testing.T) {
 			)
 		`
 		query = `
-			SELECT 
-				int8, 
-				int16, 
+			SELECT
+				int8,
+				int16,
 				int32,
 				int64,
-				uint8, 
-				uint16, 
+				uint8,
+				uint16,
 				uint32,
 				uint64,
 				float32,
@@ -105,7 +154,12 @@ func Test_Insert(t *testing.T) {
 				string,
 				fString,
 				date,
-				datetime
+				datetime,
+				datetime64,
+				ipv4,
+				ipv6,
+				ipv4str,
+				ipv6str
 			FROM clickhouse_test_insert
 		`
 	)
@@ -120,14 +174,21 @@ func Test_Insert(t *testing.T) {
 								uint8(1*i), uint16(2*i), uint32(4*i), uint64(8*i), // uint
 								1.32*float32(i), 1.64*float64(i), //float
 								fmt.Sprintf("string %d", i), // string
-								"RU",       //fixedstring,
-								time.Now(), //date
-								time.Now(), //datetime
+								"RU",                        //fixedstring,
+								time.Now(),                  //date
+								time.Now(),                  //datetime
+								time.Now(),                  //datetime64
+								"1.2.3.4",                   // ipv4
+								"2001:0db8:85a3:0000:0000:8a2e:0370:7334", //ipv6
+								column.IP(net.ParseIP("127.0.0.1").To4()),
+								column.IP(net.ParseIP("2001:0db8:85a3:0000:0000:8a2e:0370:7334")),
 							)
 							if !assert.NoError(t, err) {
 								return
 							}
 						}
+					} else {
+						return
 					}
 					if assert.NoError(t, tx.Commit()) {
 						var item struct {
@@ -145,6 +206,11 @@ func Test_Insert(t *testing.T) {
 							FixedString string
 							Date        time.Time
 							DateTime    time.Time
+							DateTime64  time.Time
+							Ipv6        column.IP
+							Ipv4        column.IP
+							Ipv4str     column.IP
+							Ipv6str     column.IP
 						}
 						if rows, err := connect.Query(query); assert.NoError(t, err) {
 							var count int
@@ -165,12 +231,114 @@ func Test_Insert(t *testing.T) {
 									&item.FixedString,
 									&item.Date,
 									&item.DateTime,
+									&item.DateTime64,
+									&item.Ipv4,
+									&item.Ipv6,
+									&item.Ipv4str,
+									&item.Ipv6str,
 								)
 								if !assert.NoError(t, err) {
 									return
 								}
 							}
 							assert.Equal(t, int(10), count)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func Test_InsertBatch(t *testing.T) {
+	const (
+		ddl = `
+			CREATE TABLE clickhouse_test_insert_batch (
+				int8  Int8,
+				int16 Int16,
+				int32 Int32,
+				int64 Int64,
+				uint8  UInt8,
+				uint16 UInt16,
+				uint32 UInt32,
+				uint64 UInt64,
+				float32 Float32,
+				float64 Float64,
+				string  String,
+				fString FixedString(2),
+				date    Date,
+				datetime DateTime,
+				arrayString Array(String)
+			) Engine=Memory
+		`
+		dml = `
+			INSERT INTO clickhouse_test_insert_batch (
+				int8,
+				int16,
+				int32,
+				int64,
+				uint8,
+				uint16,
+				uint32,
+				uint64,
+				float32,
+				float64,
+				string,
+				fString,
+				date,
+				datetime,
+				arrayString
+			) VALUES (
+				?,
+				?,
+				?,
+				?,
+				?,
+				?,
+				?,
+				?,
+				?,
+				?,
+				?,
+				?,
+				?,
+				?,
+				?
+			)
+		`
+		query = `SELECT COUNT(*) FROM clickhouse_test_insert_batch`
+	)
+	if connect, err := sql.Open("clickhouse", "tcp://127.0.0.1:9000?debug=true&block_size=11"); assert.NoError(t, err) && assert.NoError(t, connect.Ping()) {
+		if _, err := connect.Exec("DROP TABLE IF EXISTS clickhouse_test_insert_batch"); assert.NoError(t, err) {
+			if _, err := connect.Exec(ddl); assert.NoError(t, err) {
+				if tx, err := connect.Begin(); assert.NoError(t, err) {
+					if stmt, err := tx.Prepare(dml); assert.NoError(t, err) {
+						for i := 1; i <= 1000; i++ {
+							_, err = stmt.Exec(
+								-1*i, -2*i, -4*i, -8*i, // int
+								uint8(1*i), uint16(2*i), uint32(4*i), uint64(8*i), // uint
+								1.32*float32(i), 1.64*float64(i), //float
+								fmt.Sprintf("string %d ", i), // string
+								"RU",                         //fixedstring,
+								time.Now(),                   //date
+								time.Now(),                   //datetime
+								[]string{"A", "B", "C"},
+							)
+							if !assert.NoError(t, err) {
+								return
+							}
+						}
+					}
+					if assert.NoError(t, tx.Commit()) {
+						if rows, err := connect.Query(query); assert.NoError(t, err) {
+							var count int
+							for rows.Next() {
+								err := rows.Scan(&count)
+								if !assert.NoError(t, err) {
+									return
+								}
+							}
+							assert.Equal(t, int(1000), count)
 						}
 					}
 				}
@@ -199,7 +367,7 @@ func Test_Select(t *testing.T) {
 			if _, err := connect.Exec(ddl); assert.NoError(t, err) {
 				if tx, err := connect.Begin(); assert.NoError(t, err) {
 					if stmt, err := tx.Prepare(dml); assert.NoError(t, err) {
-						if _, err := stmt.Exec(1, "RU", clickhouse.Date(time.Date(2017, 1, 20, 0, 0, 0, 0, time.Local)), time.Date(2017, 1, 20, 13, 0, 0, 0, time.Local)); !assert.NoError(t, err) {
+						if _, err := stmt.Exec(1, "RU", types.Date(time.Date(2017, 1, 20, 0, 0, 0, 0, time.Local)), time.Date(2017, 1, 20, 13, 0, 0, 0, time.Local)); !assert.NoError(t, err) {
 							return
 						}
 						if _, err := stmt.Exec(2, "UA", time.Date(2017, 1, 20, 0, 0, 0, 0, time.UTC), time.Date(2017, 1, 20, 14, 0, 0, 0, time.Local)); !assert.NoError(t, err) {
@@ -240,6 +408,67 @@ func Test_Select(t *testing.T) {
 								var count int
 								if err := row.Scan(&count); assert.NoError(t, err) {
 									assert.Equal(t, int(3), count)
+								}
+							}
+							if row := connect.QueryRow("SELECT COUNT(*) FROM clickhouse_test_select WHERE id BETWEEN ? AND ?", 0, 3); assert.NotNil(t, row) {
+								var count int
+								if err := row.Scan(&count); assert.NoError(t, err) {
+									assert.Equal(t, int(3), count)
+								}
+							}
+							if rows, err := connect.Query("SELECT id FROM clickhouse_test_select ORDER BY id LIMIT ?", 1); assert.NoError(t, err) {
+								i := 0
+								for rows.Next() {
+									var (
+										id int32
+									)
+									if err := rows.Scan(&id); assert.NoError(t, err) {
+										if i == 0 {
+											assert.Equal(t, id, int32(1))
+										} else {
+											t.Error("Should return exactly one record")
+										}
+									}
+									i++
+								}
+								rows.Close()
+							}
+							if rows, err := connect.Query("SELECT id FROM clickhouse_test_select ORDER BY id LIMIT ?,?", 1, 2); assert.NoError(t, err) {
+								i := 0
+								for rows.Next() {
+									var (
+										id int32
+									)
+									if err := rows.Scan(&id); assert.NoError(t, err) {
+										if i == 0 {
+											assert.Equal(t, id, int32(2))
+										} else if i == 1 {
+											assert.Equal(t, id, int32(3))
+										} else {
+											t.Error("Should return exactly two records")
+										}
+									}
+									i++
+								}
+								rows.Close()
+							}
+						}
+
+						{
+							row1 := connect.QueryRow("SELECT COUNT(*) /* ROW1 */ FROM clickhouse_test_select WHERE date = ?", time.Date(2017, 1, 20, 0, 0, 0, 0, time.UTC))
+							row2 := connect.QueryRow("SELECT COUNT(*) /* ROW2 */ FROM clickhouse_test_select WHERE datetime = ?", time.Date(2017, 1, 20, 14, 0, 0, 0, time.Local))
+
+							if assert.NotNil(t, row2) {
+								var count int
+								if err := row2.Scan(&count); assert.NoError(t, err) {
+									assert.Equal(t, int(2), count)
+								}
+							}
+
+							if assert.NotNil(t, row1) {
+								var count int
+								if err := row1.Scan(&count); assert.NoError(t, err) {
+									assert.Equal(t, int(2), count)
 								}
 							}
 						}
@@ -308,17 +537,21 @@ func Test_ArrayT(t *testing.T) {
 				string   Array(String),
 				fString  Array(FixedString(2)),
 				date     Array(Date),
-				datetime Array(DateTime)
+				datetime Array(DateTime),
+				enum8    Array(Enum8 ('a' = 1, 'b' = 2)),
+				enum16   Array(Enum16('c' = 1, 'd' = 2)),
+				ipv4 Array(IPv4),
+				ipv6 Array(IPv6)
 			) Engine=Memory
 		`
 		dml = `
 			INSERT INTO clickhouse_test_array (
 				int8,
-				int16, 
+				int16,
 				int32,
 				int64,
-				uint8, 
-				uint16, 
+				uint8,
+				uint16,
 				uint32,
 				uint64,
 				float32,
@@ -326,10 +559,12 @@ func Test_ArrayT(t *testing.T) {
 				string,
 				fString,
 				date,
-				datetime
+				datetime,
+				enum8,
+				enum16,
+				ipv4,
+				ipv6
 			) VALUES (
-				?, 
-				?, 
 				?,
 				?,
 				?,
@@ -342,16 +577,22 @@ func Test_ArrayT(t *testing.T) {
 				?,
 				?,
 				?
+				?,
+				?,
+				?,
+				?,
+				?,
+				?
 			)
 		`
 		query = `
-			SELECT 
-				int8, 
-				int16, 
+			SELECT
+				int8,
+				int16,
 				int32,
 				int64,
-				uint8, 
-				uint16, 
+				uint8,
+				uint16,
 				uint32,
 				uint64,
 				float32,
@@ -359,7 +600,9 @@ func Test_ArrayT(t *testing.T) {
 				string,
 				fString,
 				date,
-				datetime
+				datetime,
+				ipv4,
+				ipv6
 			FROM clickhouse_test_array
 		`
 	)
@@ -370,39 +613,47 @@ func Test_ArrayT(t *testing.T) {
 					if stmt, err := tx.Prepare(dml); assert.NoError(t, err) {
 						for i := 1; i <= 10; i++ {
 							_, err = stmt.Exec(
-								clickhouse.Array([]int8{1, 2, 3}),
-								clickhouse.Array([]int16{5, 6, 7}),
-								clickhouse.Array([]int32{8, 9, 10}),
-								clickhouse.Array([]int64{11, 12, 13}),
+								[]int8{1, 2, 3},
+								[]int16{5, 6, 7},
+								[]int32{8, 9, 10},
+								[]int64{11, 12, 13},
 								clickhouse.Array([]uint8{14, 15, 16}),
-								clickhouse.Array([]uint16{17, 18, 19}),
-								clickhouse.Array([]uint32{20, 21, 22}),
-								clickhouse.Array([]uint64{23, 24, 25}),
-								clickhouse.Array([]float32{32.1, 32.2}),
-								clickhouse.Array([]float64{64.1, 64.2}),
-								clickhouse.Array([]string{fmt.Sprintf("A_%d", i), "B", "C"}),
-								clickhouse.ArrayFixedString(2, []string{"RU", "EN", "DE"}),
-								clickhouse.ArrayDate([]time.Time{time.Now(), time.Now()}),
-								clickhouse.ArrayDateTime([]time.Time{time.Now(), time.Now()}),
+								[]uint16{17, 18, 19},
+								[]uint32{20, 21, 22},
+								[]uint64{23, 24, 25},
+								[]float32{32.1, 32.2},
+								[]float64{64.1, 64.2},
+								[]string{fmt.Sprintf("A_%d", i), "B", "C"},
+								[]string{"RU", "EN", "DE"},
+								[]time.Time{time.Now(), time.Now()},
+								[]time.Time{time.Now(), time.Now()},
+								[]string{"a", "b"},
+								[]string{"c", "d"},
+								[]string{"127.0.0.1", "1.2.3.4"},
+								[]string{"2001:0db8:85a3:0000:0000:8a2e:0370:7334"},
 							)
 							if !assert.NoError(t, err) {
 								return
 							}
 							_, err = stmt.Exec(
-								clickhouse.Array([]int8{100, 101, 102, 103, 104, 105}),
-								clickhouse.Array([]int16{200, 201}),
-								clickhouse.Array([]int32{300, 301, 302, 303}),
-								clickhouse.Array([]int64{400, 401, 402}),
+								[]int8{100, 101, 102, 103, 104, 105},
+								[]int16{200, 201},
+								[]int32{300, 301, 302, 303},
+								[]int64{400, 401, 402},
 								clickhouse.Array([]uint8{250, 251, 252, 253, 254}),
-								clickhouse.Array([]uint16{1000, 1001, 1002, 1003, 1004}),
-								clickhouse.Array([]uint32{2001, 2002}),
-								clickhouse.Array([]uint64{3000}),
-								clickhouse.Array([]float32{1000.1, 100.1, 2000}),
-								clickhouse.Array([]float64{640, 8, 650.9, 703.5, 800}),
-								clickhouse.Array([]string{fmt.Sprintf("D_%d", i), "E", "F", "G"}),
-								clickhouse.ArrayFixedString(2, []string{"UA", "GB"}),
-								clickhouse.ArrayDate([]time.Time{time.Now(), time.Now(), time.Now(), time.Now()}),
-								clickhouse.ArrayDateTime([]time.Time{time.Now(), time.Now()}),
+								[]uint16{1000, 1001, 1002, 1003, 1004},
+								[]uint32{2001, 2002},
+								[]uint64{3000},
+								[]float32{1000.1, 100.1, 2000},
+								[]float64{640, 8, 650.9, 703.5, 800},
+								[]string{fmt.Sprintf("D_%d", i), "E", "F", "G"},
+								[]string{"UA", "GB"},
+								[]time.Time{time.Now(), time.Now(), time.Now(), time.Now()},
+								[]time.Time{time.Now(), time.Now()},
+								[]string{"a", "b"},
+								[]string{"c", "d"},
+								[]string{"127.0.0.1", "1.2.3.4"},
+								[]string{"2001:0db8:85a3:0000:0000:8a2e:0370:7334"},
 							)
 							if !assert.NoError(t, err) {
 								return
@@ -425,6 +676,8 @@ func Test_ArrayT(t *testing.T) {
 							FixedString []string
 							Date        []time.Time
 							DateTime    []time.Time
+							Ipv4        []column.IP
+							Ipv6        []column.IP
 						}
 						if rows, err := connect.Query(query); assert.NoError(t, err) {
 							var count int
@@ -445,6 +698,8 @@ func Test_ArrayT(t *testing.T) {
 									&item.FixedString,
 									&item.Date,
 									&item.DateTime,
+									&item.Ipv4,
+									&item.Ipv6,
 								)
 								if !assert.NoError(t, err) {
 									return
@@ -472,6 +727,10 @@ func Test_ArrayT(t *testing.T) {
 								t.Logf("Date=%v, DateTime=%v",
 									item.Date,
 									item.DateTime,
+								)
+								t.Logf("Ipv4=%v, Ipv6=%v",
+									item.Ipv4,
+									item.Ipv6,
 								)
 							}
 							assert.Equal(t, int(20), count)
@@ -521,7 +780,7 @@ func Test_With_Totals(t *testing.T) {
 		`
 		dml   = `INSERT INTO clickhouse_test_with_totals (country) VALUES (?)`
 		query = `
-			SELECT 
+			SELECT
 				country,
 				COUNT(*)
 			FROM clickhouse_test_with_totals
@@ -578,13 +837,27 @@ func Test_With_Totals(t *testing.T) {
 									if !assert.Equal(t, int64(2), item.Count) {
 										return
 									}
-								default:
-									if !assert.Equal(t, int64(6), item.Count) {
-										return
-									}
 								}
 							}
-							assert.Equal(t, int(3), count)
+
+							if assert.Equal(t, int(2), count) && assert.True(t, rows.NextResultSet()) {
+								var count int
+								for rows.Next() {
+									count++
+									err := rows.Scan(
+										&item.Country,
+										&item.Count,
+									)
+									if !assert.NoError(t, err) {
+										return
+									}
+
+									if assert.Equal(t, "\x00\x00", item.Country) {
+										assert.Equal(t, int64(6), item.Count)
+									}
+								}
+								assert.Equal(t, int(1), count)
+							}
 						}
 					}
 				}
@@ -602,8 +875,9 @@ func Test_Tx(t *testing.T) {
 					return
 				}
 			}
-			_, err = tx.Query("SELECT 1")
-			assert.Error(t, err)
+			if _, err := tx.Query("SELECT 2"); assert.Error(t, err) {
+				assert.Equal(t, sql.ErrTxDone, err)
+			}
 		}
 	}
 }
@@ -620,7 +894,7 @@ func Test_Temporary_Table(t *testing.T) {
 		if tx, err := connect.Begin(); assert.NoError(t, err) {
 			if _, err := tx.Exec(ddl); assert.NoError(t, err) {
 				if _, err := tx.Exec("INSERT INTO clickhouse_test_temporary_table (ID) SELECT number AS ID FROM system.numbers LIMIT 10"); assert.NoError(t, err) {
-					if rows, err := tx.Query("SELECT ID FROM clickhouse_test_temporary_table"); assert.NoError(t, err) {
+					if rows, err := tx.Query("SELECT ID AS ID FROM clickhouse_test_temporary_table"); assert.NoError(t, err) {
 						var count int
 						for rows.Next() {
 							var num int
@@ -629,8 +903,8 @@ func Test_Temporary_Table(t *testing.T) {
 							}
 							count++
 						}
-						if _, err = tx.Query("SELECT ID FROM clickhouse_test_temporary_table"); assert.NoError(t, err) {
-							if _, err = connect.Query("SELECT ID FROM clickhouse_test_temporary_table"); assert.Error(t, err) {
+						if _, err = tx.Query("SELECT ID AS ID1 FROM clickhouse_test_temporary_table"); assert.NoError(t, err) {
+							if _, err = connect.Query("SELECT ID AS ID2 FROM clickhouse_test_temporary_table"); assert.Error(t, err) {
 								if exception, ok := err.(*clickhouse.Exception); assert.True(t, ok) {
 									assert.Equal(t, int32(60), exception.Code)
 								}
@@ -648,8 +922,106 @@ func Test_Temporary_Table(t *testing.T) {
 	}
 }
 
-func Test_Enum(t *testing.T) {
+func Test_Select_External_Tables(t *testing.T) {
+	const (
+		ddl = `
+			CREATE TABLE clickhouse_test_select_external_tables (
+				string1  String,
+				string2  String
+			) Engine=Memory
+		`
+		dml = `
+			INSERT INTO clickhouse_test_select_external_tables (
+				string1,
+				string2
+			) VALUES (
+				?,
+				?
+			)
+		`
+		query      = `SELECT COUNT(*) FROM clickhouse_test_select_external_tables WHERE string1 IN ? AND string2 IN ? AND string1 NOT IN ?`
+		queryNamed = `SELECT COUNT(*) FROM clickhouse_test_select_external_tables WHERE string1 IN @e1 AND string2 IN @e2 AND string1 NOT IN @e3`
+	)
+	if connect, err := sql.Open("clickhouse", "tcp://127.0.0.1:9000?debug=true"); assert.NoError(t, err) && assert.NoError(t, connect.Ping()) {
+		if _, err := connect.Exec("DROP TABLE IF EXISTS clickhouse_test_select_external_tables"); assert.NoError(t, err) {
+			if _, err := connect.Exec(ddl); assert.NoError(t, err) {
+				if tx, err := connect.Begin(); assert.NoError(t, err) {
+					if stmt, err := tx.Prepare(dml); assert.NoError(t, err) {
+						for i := 1; i <= 1000; i++ {
+							_, err = stmt.Exec(
+								fmt.Sprintf("string %d", i), // string1
+								fmt.Sprintf("string %d", i), // string2
+							)
+							if !assert.NoError(t, err) {
+								return
+							}
+						}
+					}
 
+					col, err := column.Factory("c1", "String", nil)
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					externalTable1 := clickhouse.ExternalTable{
+						Name: "e1",
+						Values: [][]driver.Value{
+							{"string 1"},
+							{"string 2"},
+						},
+						Columns: []column.Column{
+							col,
+						},
+					}
+					externalTable2 := clickhouse.ExternalTable{
+						Name: "e2",
+						Values: [][]driver.Value{
+							{"string 1"},
+							{"string 2"},
+						},
+						Columns: []column.Column{
+							col,
+						},
+					}
+					externalTable3 := clickhouse.ExternalTable{
+						Name: "e3",
+						Values: [][]driver.Value{
+							{"string 1"},
+						},
+						Columns: []column.Column{
+							col,
+						},
+					}
+					if assert.NoError(t, tx.Commit()) {
+						if rows, err := connect.Query(query, externalTable1, externalTable2, externalTable3); assert.NoError(t, err) {
+							var count int
+							for rows.Next() {
+								err := rows.Scan(&count)
+								if !assert.NoError(t, err) {
+									return
+								}
+							}
+							assert.Equal(t, 1, count)
+						}
+						if rows, err := connect.Query(queryNamed, sql.Named("e1", externalTable1),
+							sql.Named("e2", externalTable2), sql.Named("e3", externalTable3)); assert.NoError(t, err) {
+							var count int
+							for rows.Next() {
+								err := rows.Scan(&count)
+								if !assert.NoError(t, err) {
+									return
+								}
+							}
+							assert.Equal(t, 1, count)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func Test_Enum(t *testing.T) {
 	const (
 		ddl = `
 			CREATE TABLE clickhouse_test_enum (
@@ -666,10 +1038,10 @@ func Test_Enum(t *testing.T) {
 			if _, err := connect.Exec(ddl); assert.NoError(t, err) {
 				if tx, err := connect.Begin(); assert.NoError(t, err) {
 					if stmt, err := tx.Prepare(dml); assert.NoError(t, err) {
-						if _, err := stmt.Exec("a", "c", clickhouse.Array([]string{"a", "b"}), clickhouse.Array([]string{"c", "d"})); !assert.NoError(t, err) {
+						if _, err := stmt.Exec("a", "c", []string{"a", "b"}, []string{"c", "d"}); !assert.NoError(t, err) {
 							return
 						}
-						if _, err := stmt.Exec("b", "d", clickhouse.Array([]string{"b", "a"}), clickhouse.Array([]string{"d", "c"})); !assert.NoError(t, err) {
+						if _, err := stmt.Exec("b", "d", []string{"b", "a"}, []string{"d", "c"}); !assert.NoError(t, err) {
 							return
 						}
 					}
@@ -687,6 +1059,497 @@ func Test_Enum(t *testing.T) {
 				)
 				if err := rows.Scan(&a, &b, &c, &d); assert.NoError(t, err) {
 					t.Log(a, b, c, d)
+				}
+			}
+		}
+	}
+}
+
+func Test_Ternary_Operator(t *testing.T) {
+	const (
+		ddl = `
+			CREATE TABLE clickhouse_ternary_operator (
+				a UInt8,
+				b UInt8
+			) Engine=Memory
+		`
+		dml = `INSERT INTO clickhouse_ternary_operator VALUES (?, ?)`
+	)
+	if connect, err := sql.Open("clickhouse", "tcp://127.0.0.1:9000?debug=true"); assert.NoError(t, err) && assert.NoError(t, connect.Ping()) {
+		if _, err := connect.Exec("DROP TABLE IF EXISTS clickhouse_ternary_operator"); assert.NoError(t, err) {
+			if _, err := connect.Exec(ddl); assert.NoError(t, err) {
+				if tx, err := connect.Begin(); assert.NoError(t, err) {
+					if stmt, err := tx.Prepare(dml); assert.NoError(t, err) {
+						if _, err := stmt.Exec(1, 0); !assert.NoError(t, err) {
+							return
+						}
+					}
+					if err := tx.Commit(); !assert.NoError(t, err) {
+						return
+					}
+				}
+			}
+		}
+		if rows, err := connect.Query("SELECT a ? '+' : '-', b ? '+' : '-' FROM clickhouse_ternary_operator WHERE a = ? AND b < ?", 1, 2); assert.NoError(t, err) {
+			for rows.Next() {
+				var (
+					a, b string
+				)
+				if err := rows.Scan(&a, &b); assert.NoError(t, err) {
+					assert.Equal(t, "+", a)
+					assert.Equal(t, "-", b)
+				}
+			}
+		}
+		if rows, err := connect.Query("SELECT a, b FROM clickhouse_ternary_operator WHERE a = ? AND b < ?", 1, 2); assert.NoError(t, err) {
+			for rows.Next() {
+				var (
+					a, b int
+				)
+				if err := rows.Scan(&a, &b); assert.NoError(t, err) {
+					assert.Equal(t, 1, a)
+					assert.Equal(t, 0, b)
+				}
+			}
+		}
+		if rows, err := connect.Query(`
+			SELECT
+				a ?
+					'+' : '-',
+				b ? '+' : '-' ,
+				a, b
+			FROM clickhouse_ternary_operator
+				WHERE a = ? AND b < ? AND a IN(?,
+			?
+			) OR b = 0 OR b > ?`, 1, 2, 1, 100, -1); assert.NoError(t, err) {
+			for rows.Next() {
+				var (
+					a, b string
+					c, d int
+				)
+				if err := rows.Scan(&a, &b, &c, &d); assert.NoError(t, err) {
+					assert.Equal(t, "+", a)
+					assert.Equal(t, "-", b)
+				}
+			}
+		}
+	}
+}
+
+func Test_UUID(t *testing.T) {
+	const (
+		ddl = `
+			CREATE TABLE clickhouse_test_uuid (
+				UUID    FixedString(16),
+				Builtin UUID
+			) Engine=Memory;
+		`
+	)
+	if connect, err := sql.Open("clickhouse", "tcp://127.0.0.1:9000?debug=true"); assert.NoError(t, err) {
+		if tx, err := connect.Begin(); assert.NoError(t, err) {
+			if _, err := connect.Exec("DROP TABLE IF EXISTS clickhouse_test_uuid"); assert.NoError(t, err) {
+				if _, err := tx.Exec(ddl); assert.NoError(t, err) {
+					if tx, err := connect.Begin(); assert.NoError(t, err) {
+						if stmt, err := tx.Prepare("INSERT INTO clickhouse_test_uuid VALUES(?)"); assert.NoError(t, err) {
+							if _, err := stmt.Exec(types.UUID("123e4567-e89b-12d3-a456-426655440000"), "123e4567-e89b-12d3-a456-426655440000"); !assert.NoError(t, err) {
+								t.Fatal(err)
+							}
+						}
+						if err := tx.Commit(); !assert.NoError(t, err) {
+							t.Fatal(err)
+						}
+					}
+
+					if rows, err := connect.Query("SELECT UUID, UUIDNumToString(UUID), Builtin FROM clickhouse_test_uuid"); assert.NoError(t, err) {
+						if assert.True(t, rows.Next()) {
+							var (
+								uuid        types.UUID
+								uuidStr     string
+								builtinUUID string
+							)
+							if err := rows.Scan(&uuid, &uuidStr, &builtinUUID); assert.NoError(t, err) {
+								if assert.Equal(t, "123e4567-e89b-12d3-a456-426655440000", uuidStr) {
+									assert.Equal(t, types.UUID("123e4567-e89b-12d3-a456-426655440000"), uuid)
+									assert.Equal(t, "123e4567-e89b-12d3-a456-426655440000", builtinUUID)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func Test_IP(t *testing.T) {
+	const (
+		ddl = `
+			CREATE TABLE clickhouse_test_ip (
+				OldIPv4 FixedString(16),
+				OldIPv6 FixedString(16),
+				IPv4    IPv4,
+				IPv6    IPv6
+			) Engine=Memory;
+		`
+	)
+	var (
+		ipv4 = net.ParseIP("127.0.0.1")
+		ipv6 = net.ParseIP("2001:0db8:0000:0000:0000:ff00:0042:8329")
+	)
+	if connect, err := sql.Open("clickhouse", "tcp://127.0.0.1:9000?debug=true"); assert.NoError(t, err) {
+		if tx, err := connect.Begin(); assert.NoError(t, err) {
+			if _, err := connect.Exec("DROP TABLE IF EXISTS clickhouse_test_ip"); assert.NoError(t, err) {
+				if _, err := tx.Exec(ddl); assert.NoError(t, err) {
+					if tx, err := connect.Begin(); assert.NoError(t, err) {
+						if stmt, err := tx.Prepare("INSERT INTO clickhouse_test_ip VALUES(?, ?, ?, ?)"); assert.NoError(t, err) {
+							if _, err := stmt.Exec(column.IP(ipv4), column.IP(ipv6), ipv4, ipv6); !assert.NoError(t, err) {
+								t.Fatal(err)
+							}
+						}
+						if err := tx.Commit(); !assert.NoError(t, err) {
+							t.Fatal(err)
+						}
+					}
+					if rows, err := connect.Query("SELECT OldIPv4, OldIPv6, IPv4, IPv6 FROM clickhouse_test_ip"); assert.NoError(t, err) {
+						if assert.True(t, rows.Next()) {
+							var (
+								oldIPv4, oldIPv6 column.IP
+								v4, v6           net.IP
+							)
+							if err := rows.Scan(&oldIPv4, &oldIPv6, &v4, &v6); assert.NoError(t, err) {
+								assert.Equal(t, net.IP(oldIPv4), ipv4)
+								assert.Equal(t, net.IP(oldIPv6), ipv6)
+								assert.Equal(t, v4, ipv4)
+								assert.Equal(t, v6, ipv6)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func Test_Context_Timeout(t *testing.T) {
+	if connect, err := sql.Open("clickhouse", "tcp://127.0.0.1:9000?debug=true"); assert.NoError(t, err) && assert.NoError(t, connect.Ping()) {
+		{
+			ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*20)
+			defer cancel()
+			if row := connect.QueryRowContext(ctx, "SELECT 1, sleep(2)"); assert.NotNil(t, row) {
+				var a, b int
+				assert.Equal(t, driver.ErrBadConn, row.Scan(&a, &b))
+			}
+		}
+		{
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if row := connect.QueryRowContext(ctx, "SELECT 1, sleep(0.1)"); assert.NotNil(t, row) {
+				var value, value2 int
+				if assert.NoError(t, row.Scan(&value, &value2)) {
+					assert.Equal(t, int(1), value)
+				}
+			}
+		}
+	}
+}
+
+func Test_Ping_Context_Timeout(t *testing.T) {
+	if connect, err := sql.Open("clickhouse", "tcp://127.0.0.1:9000?debug=true"); assert.NoError(t, err) && assert.NoError(t, connect.Ping()) {
+		{
+			ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+			defer cancel()
+			if err := connect.PingContext(ctx); assert.Error(t, err) {
+				assert.Equal(t, context.DeadlineExceeded, err)
+			}
+		}
+		{
+			ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*20)
+			defer cancel()
+			if row := connect.QueryRowContext(ctx, "SELECT 1, sleep(2)"); assert.NotNil(t, row) {
+				var a, b int
+				assert.Equal(t, driver.ErrBadConn, row.Scan(&a, &b))
+			}
+		}
+		{
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if row := connect.QueryRowContext(ctx, "SELECT 1, sleep(0.1)"); assert.NotNil(t, row) {
+				var value, value2 int
+				if assert.NoError(t, row.Scan(&value, &value2)) {
+					assert.Equal(t, int(1), value)
+				}
+			}
+		}
+	}
+}
+
+func Test_Timeout(t *testing.T) {
+	if connect, err := sql.Open("clickhouse", "tcp://127.0.0.1:9000?debug=true&read_timeout=0.2"); assert.NoError(t, err) && assert.NoError(t, connect.Ping()) {
+		{
+			if row := connect.QueryRow("SELECT 1, sleep(2)"); assert.NotNil(t, row) {
+				var a, b int
+				assert.Equal(t, driver.ErrBadConn, row.Scan(&a, &b))
+			}
+		}
+		{
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if row := connect.QueryRowContext(ctx, "SELECT 1, sleep(0.1)"); assert.NotNil(t, row) {
+				var value, value2 int
+				if assert.NoError(t, row.Scan(&value, &value2)) {
+					assert.Equal(t, int(1), value)
+				}
+			}
+		}
+	}
+}
+
+func Test_InArray(t *testing.T) {
+	const (
+		ddl = `
+			CREATE TABLE clickhouse_test_in_array (
+				Value String
+			) Engine=Memory
+		`
+		dml = `
+			INSERT INTO clickhouse_test_in_array (Value) VALUES (?)
+		`
+		query = `
+			SELECT
+				groupArray(Value)
+			FROM clickhouse_test_in_array WHERE Value IN(?)
+		`
+	)
+	if connect, err := sql.Open("clickhouse", "tcp://127.0.0.1:9000?debug=true"); assert.NoError(t, err) && assert.NoError(t, connect.Ping()) {
+		if _, err := connect.Exec("DROP TABLE IF EXISTS clickhouse_test_in_array"); assert.NoError(t, err) {
+			if _, err := connect.Exec(ddl); assert.NoError(t, err) {
+				if tx, err := connect.Begin(); assert.NoError(t, err) {
+					if stmt, err := tx.Prepare(dml); assert.NoError(t, err) {
+						for _, v := range []string{"A", "B", "C"} {
+							_, err = stmt.Exec(v)
+							if !assert.NoError(t, err) {
+								return
+							}
+						}
+					} else {
+						return
+					}
+					if assert.NoError(t, tx.Commit()) {
+						var value []string
+						if err := connect.QueryRow(query, []string{"A", "C"}).Scan(&value); assert.NoError(t, err) {
+							if !assert.NoError(t, err) {
+								return
+							}
+						}
+						assert.Equal(t, []string{"A", "C"}, value)
+
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestArrayArrayT(t *testing.T) {
+	const (
+		ddl = `
+			CREATE TABLE clickhouse_test_array_array_t (
+				String1 Array(Array(String)),
+				String2 Array(Array(Array(String))),
+				Int32   Array(Array(Int32))
+			) Engine=Memory
+		`
+		dml = `
+			INSERT INTO clickhouse_test_array_array_t (String1, String2, Int32) VALUES (?)
+		`
+		query = `
+			SELECT
+				String1,
+				String2,
+				Int32
+			FROM clickhouse_test_array_array_t
+		`
+	)
+
+	items := []struct {
+		String1, String2, Int32 interface{}
+	}{
+		{
+			[][]string{
+				[]string{"A"},
+				[]string{"BC"},
+				[]string{"DEF"},
+			},
+			[][][]string{
+				[][]string{
+					[]string{"X"},
+					[]string{"Y"},
+				},
+				[][]string{
+					[]string{"ZZ"},
+				},
+			},
+			[][]int32{
+				[]int32{1},
+				[]int32{2, 3},
+			},
+		},
+		{
+			[][][]byte{
+				[][]byte{[]byte("AA")},
+				[][]byte{[]byte("BB")},
+				[][]byte{[]byte("C4C")},
+			},
+			[][][][]byte{
+				[][][]byte{
+					[][]byte{[]byte("XX"), []byte("YY")},
+				},
+			},
+			[][]int32{
+				[]int32{4, 5, 6},
+			},
+		},
+	}
+
+	if connect, err := sql.Open("clickhouse", "tcp://127.0.0.1:9000?debug=true"); assert.NoError(t, err) && assert.NoError(t, connect.Ping()) {
+		if _, err := connect.Exec("DROP TABLE IF EXISTS clickhouse_test_array_array_t"); assert.NoError(t, err) {
+			if _, err := connect.Exec(ddl); assert.NoError(t, err) {
+				if tx, err := connect.Begin(); assert.NoError(t, err) {
+					if stmt, err := tx.Prepare(dml); assert.NoError(t, err) {
+						for _, item := range items {
+							_, err = stmt.Exec(item.String1, item.String2, item.Int32)
+							if !assert.NoError(t, err) {
+								return
+							}
+						}
+
+					}
+					if assert.NoError(t, tx.Commit()) {
+						var result struct {
+							String1 [][]string
+							String2 [][][]string
+							Int32   [][]int32
+						}
+
+						row := connect.QueryRow(query)
+						if err := row.Scan(&result.String1, &result.String2, &result.Int32); assert.NoError(t, err) {
+							assert.Equal(t, items[0].String1, result.String1)
+							assert.Equal(t, items[0].String2, result.String2)
+							assert.Equal(t, items[0].Int32, result.Int32)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func Test_LikeQuery(t *testing.T) {
+	const (
+		ddl = `
+			CREATE TABLE clickhouse_test_like (
+				firstName String,
+                lastName String
+			) Engine=Memory
+		`
+		dml = `
+			INSERT INTO clickhouse_test_like (
+  				firstName,
+				lastName
+			) VALUES (
+				?,
+                ?
+			)
+		`
+		query = `
+			SELECT
+				firstName,
+                lastName
+			FROM clickhouse_test_like
+			WHERE firstName LIKE ? and lastName LIKE ?
+		`
+	)
+	if connect, err := sql.Open("clickhouse", "tcp://127.0.0.1:9000?debug=true"); assert.NoError(t, err) && assert.NoError(t, connect.Ping()) {
+		if _, err := connect.Exec("DROP TABLE IF EXISTS clickhouse_test_like"); assert.NoError(t, err) {
+			if _, err := connect.Exec(ddl); assert.NoError(t, err) {
+				if tx, err := connect.Begin(); assert.NoError(t, err) {
+					if stmt, err := tx.Prepare(dml); assert.NoError(t, err) {
+						var names = []struct {
+							First string
+							Last  string
+						}{
+							{First: "JeanPierre", Last: "Baltasar"}, {First: "DonPierre", Last: "Baltasar"},
+						}
+						for i := range names {
+							_, err = stmt.Exec(
+								names[i].First,
+								names[i].Last,
+							)
+							if !assert.NoError(t, err) {
+								return
+							}
+						}
+					}
+					if assert.NoError(t, tx.Commit()) {
+						var tests = []struct {
+							Param1        string
+							Param2        string
+							ExpectedFirst string
+							ExpectedLast  string
+						}{
+							{
+								Param1:        "Don%",
+								Param2:        "%lta%",
+								ExpectedFirst: "DonPierre",
+								ExpectedLast:  "Baltasar",
+							},
+							{
+								Param1:        "%eanP%",
+								Param2:        "%asar",
+								ExpectedFirst: "JeanPierre",
+								ExpectedLast:  "Baltasar",
+							},
+							{
+								Param1:        "Don",
+								Param2:        "%asar",
+								ExpectedFirst: "",
+								ExpectedLast:  "",
+							},
+							{
+								Param1:        "Jean%",
+								Param2:        "%",
+								ExpectedFirst: "JeanPierre",
+								ExpectedLast:  "Baltasar",
+							},
+							{
+								Param1:        "%",
+								Param2:        "Baptiste",
+								ExpectedFirst: "",
+								ExpectedLast:  "",
+							},
+						}
+
+						for _, test := range tests {
+							var result struct {
+								FirstName string
+								LastName  string
+							}
+							if rows, err := connect.Query(query, test.Param1, test.Param2); assert.NoError(t, err) {
+
+								for rows.Next() {
+									err := rows.Scan(
+										&result.FirstName,
+										&result.LastName,
+									)
+									if !assert.NoError(t, err) {
+										return
+									}
+								}
+								assert.Equal(t, test.ExpectedFirst, result.FirstName)
+								assert.Equal(t, test.ExpectedLast, result.LastName)
+							}
+						}
+					}
 				}
 			}
 		}

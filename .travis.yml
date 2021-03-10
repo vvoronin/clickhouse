@@ -1,18 +1,21 @@
 sudo: required
 language: go
-go: 
-  - 1.7
-  - tip
+go:
+  - 1.14.x
+  - 1.15.x
+  - master
+go_import_path: github.com/ClickHouse/clickhouse-go
 services:
   - docker
 install:
-  - go get github.com/mattn/goveralls
-  - go get golang.org/x/tools/cmd/cover
-  - go get github.com/stretchr/testify/assert
+  - export GO111MODULE="on"
+  - go mod vendor
+
 before_install:
-  - docker pull yandex/clickhouse-server
-  - docker run -d --name clickhouse-server -p 9000:9000 --ulimit nofile=262144:262144 yandex/clickhouse-server
-  - docker ps -a
+  - docker --version
+  - docker-compose --version
+  - docker-compose up -d
 script:
-  - go test -v -race -covermode=count -coverprofile=coverage.out .
-  - goveralls -coverprofile=coverage.out -service travis-ci -repotoken $COVERALLS_TOKEN
+  - ./go.test.sh
+after_success:
+  - bash <(curl -s https://codecov.io/bash)

@@ -1,40 +1,63 @@
 package clickhouse
 
-func (ch *clickhouse) sendQuery(query string) error {
-	ch.log("[send query] %s", query)
-	if err := writeUvarint(ch.conn, ClientQueryPacket); err != nil {
+import (
+	"github.com/ClickHouse/clickhouse-go/lib/data"
+	"github.com/ClickHouse/clickhouse-go/lib/protocol"
+)
+
+func (ch *clickhouse) sendQuery(query string, externalTables []ExternalTable) error {
+	ch.logf("[send query] %s", query)
+	if err := ch.encoder.Uvarint(protocol.ClientQuery); err != nil {
 		return err
 	}
-	if err := writeString(ch.conn, ""); err != nil {
+	if err := ch.encoder.String(""); err != nil {
 		return err
 	}
-	if ch.serverRevision >= DBMS_MIN_REVISION_WITH_CLIENT_INFO {
-		writeUvarint(ch.conn, 1)
-		writeString(ch.conn, "")
-		writeString(ch.conn, "") //initial_query_id
-		writeString(ch.conn, "[::ffff:127.0.0.1]:0")
-		writeUvarint(ch.conn, 1) // iface type TCP
-		writeString(ch.conn, hostname)
-		writeString(ch.conn, "localhost")
-		writeString(ch.conn, ClientName)
-		writeUvarint(ch.conn, ClickHouseDBMSVersionMajor)
-		writeUvarint(ch.conn, ClickHouseDBMSVersionMinor)
-		writeUvarint(ch.conn, ClickHouseRevision)
-		if ch.serverRevision >= DBMS_MIN_REVISION_WITH_QUOTA_KEY_IN_CLIENT_INFO {
-			writeString(ch.conn, "")
+	{ // client info
+		ch.encoder.Uvarint(1)
+		ch.encoder.String("")
+		ch.encoder.String("") //initial_query_id
+		ch.encoder.String("[::ffff:127.0.0.1]:0")
+		ch.encoder.Uvarint(1) // iface type TCP
+		ch.encoder.String(hostname)
+		ch.encoder.String(hostname)
+	}
+	if err := ch.ClientInfo.Write(ch.encoder); err != nil {
+		return err
+	}
+	if ch.ServerInfo.Revision >= protocol.DBMS_MIN_REVISION_WITH_QUOTA_KEY_IN_CLIENT_INFO {
+		ch.encoder.String("")
+	}
+
+	// the settings are written as list of contiguous name-value pairs, finished with empty name
+	if !ch.settings.IsEmpty() {
+		ch.logf("[query settings] %s", ch.settings.settingsStr)
+		if err := ch.settings.Serialize(ch.encoder); err != nil {
+			return err
 		}
 	}
-	if err := writeString(ch.conn, ""); err != nil { // settings
+	// empty string is a marker of the end of the settings
+	if err := ch.encoder.String(""); err != nil {
 		return err
 	}
-	if err := writeUvarint(ch.conn, StateComplete); err != nil {
+	if err := ch.encoder.Uvarint(protocol.StateComplete); err != nil {
 		return err
 	}
-	if err := writeUvarint(ch.conn, 0); err != nil { // compress
+	compress := protocol.CompressDisable
+	if ch.compress {
+		compress = protocol.CompressEnable
+	}
+	if err := ch.encoder.Uvarint(compress); err != nil {
 		return err
 	}
-	if err := writeString(ch.conn, query); err != nil {
+	if err := ch.encoder.String(query); err != nil {
 		return err
 	}
-	return (&block{}).write(ch.serverRevision, ch.conn)
+	if err := ch.sendExternalTables(externalTables); err != nil {
+		return err
+	}
+	if err := ch.writeBlock(&data.Block{}, ""); err != nil {
+		return err
+	}
+	return ch.encoder.Flush()
 }
